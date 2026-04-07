@@ -1,7 +1,5 @@
 from pathlib import Path
 
-from anyio import to_thread
-
 from nonebot import get_driver, get_plugin_config, require
 from nonebot.log import logger
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
@@ -115,8 +113,7 @@ async def handle_tgsd(sticker_pack_url: str) -> None:
     )
     try:
         for zip_path in zips.values():
-            file_bytes = await to_thread.run_sync(zip_path.read_bytes)
-            await UniMessage.file(raw=file_bytes, name=zip_path.name).send()
+            await UniMessage.file(path=zip_path, name=zip_path.name).send()
     except Exception as e:
         logger.exception(f"发送压缩包失败: {e}")
         await tgsd_command.finish("下载完成, 但发送压缩包失败, 请稍后重试")
