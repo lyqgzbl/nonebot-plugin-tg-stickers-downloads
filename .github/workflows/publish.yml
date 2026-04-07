@@ -23,6 +23,6 @@ jobs:
       - name: Install Python 3.14
         run: uv python install 3.14
       - name: Build package
-        run: uv builds
+        run: uv build
       - name: Publish package
         run: uv publish
