@@ -5,6 +5,7 @@ from nonebot.log import logger
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.rule import Rule
 
+
 require("nonebot_plugin_alconna")
 require("nonebot_plugin_localstore")
 require("nonebot_plugin_apscheduler")
@@ -37,7 +38,7 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters=inherit_supported_adapters("nonebot_plugin_alconna"),
     extra={
         "author": "lyqgzbl <admin@lyqgzbl.com",
-        "version": "0.1.1",
+        "version": "0.2.0",
     },
 )
 
