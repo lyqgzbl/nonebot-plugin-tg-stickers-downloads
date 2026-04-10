@@ -1,5 +1,3 @@
-import importlib
-import importlib.util
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -16,7 +14,6 @@ plugin_config = get_plugin_config(Config)
 default_ffmpeg_path = plugin_config.tgsd_ffmpeg_path
 default_gifsicle_path = plugin_config.tgsd_gifsicle_path
 default_imagemagick_path = plugin_config.tgsd_imagemagick_path
-PILLOW_AVAILABLE = importlib.util.find_spec("PIL") is not None
 
 
 class ConverterError(RuntimeError):
@@ -43,6 +40,12 @@ def find_gifsicle(explicit_path: str | None = None) -> str | None:
     return shutil.which("gifsicle")
 
 
+def find_imagemagick(explicit_path: str | None = None) -> str | None:
+    if explicit_path:
+        return explicit_path
+    return shutil.which("magick") or shutil.which("convert")
+
+
 def resolve_converter_tools(
     *,
     ffmpeg_path: str | None = None,
@@ -51,7 +54,9 @@ def resolve_converter_tools(
 ) -> ConverterTools:
     ffmpeg_path = ffmpeg_path or default_ffmpeg_path
     gifsicle_path = gifsicle_path or default_gifsicle_path
-    configured_imagemagick_path = imagemagick_path or default_imagemagick_path
+    configured_imagemagick_path = find_imagemagick(
+        imagemagick_path or default_imagemagick_path
+    )
     magick_tools = None
     if configured_imagemagick_path:
         binary_name = Path(configured_imagemagick_path).name.lower()
@@ -59,7 +64,7 @@ def resolve_converter_tools(
             magick_tools = [configured_imagemagick_path, "convert"]
         else:
             magick_tools = [configured_imagemagick_path]
-    use_pillow = (not magick_tools) and PILLOW_AVAILABLE
+    use_pillow = (not magick_tools) and pil_image is not None
     return ConverterTools(
         ffmpeg=find_ffmpeg(ffmpeg_path),
         gifsicle=find_gifsicle(gifsicle_path),
@@ -132,6 +137,7 @@ def convert_webp_to_png(
             "ImageMagick failed converting "
             f"{src_image.name} -> {dst_png.name}: {stderr}"
         )
+    # logger.debug(f"Converted {src_image.name} -> {dst_png.name} using ImageMagick")
     return dst_png
 
 
@@ -141,6 +147,7 @@ def convert_webp_to_png_pillow(*, src_image: Path, dst_png: Path) -> Path:
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
             img.save(dst_png, "PNG", optimize=True)
+            # logger.debug(f"Converted {src_image.name} -> {dst_png.name} using Pillow")
         return dst_png
     except Exception as exc:
         raise ConverterError(
