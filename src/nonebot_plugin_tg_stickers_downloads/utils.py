@@ -23,7 +23,7 @@ from .converter import convert_sticker_file, resolve_converter_tools
 plugin_config = get_plugin_config(Config)
 bot_token = plugin_config.tgsd_bot_token
 proxy = plugin_config.tgsd_proxy
-tgsd_cache_path = store.get_cache_dir("nonebot_plugin_tg_stickers_downloads")
+tgsd_cache_path = store.get_plugin_cache_dir()
 
 
 _httpx_client: httpx.AsyncClient | None = None
