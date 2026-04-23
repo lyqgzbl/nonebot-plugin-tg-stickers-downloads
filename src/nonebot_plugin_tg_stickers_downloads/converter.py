@@ -163,6 +163,7 @@ def convert_tgs_to_gif(*, src_tgs: Path, dst_gif: Path) -> Path:
             "rlottie_python not installed. Install it to enable "
             ".tgs -> .gif conversion."
         ) from exc
+    anim = None
     try:
         anim = LottieAnimation.from_tgs(str(src_tgs))
         anim.save_animation(str(dst_gif))
@@ -170,6 +171,8 @@ def convert_tgs_to_gif(*, src_tgs: Path, dst_gif: Path) -> Path:
         raise ConverterError(
             f"Failed converting {src_tgs.name} -> {dst_gif.name}: {exc}"
         ) from exc
+    finally:
+        del anim
     return dst_gif
 
 
