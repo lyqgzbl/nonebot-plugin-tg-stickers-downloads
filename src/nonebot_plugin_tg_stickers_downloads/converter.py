@@ -1,19 +1,18 @@
+import asyncio
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import PIL.Image as pil_image
 
-from nonebot import get_plugin_config
 from nonebot.log import logger
-from .config import Config
+from .config import plugin_config
 
 
-plugin_config = get_plugin_config(Config)
 default_ffmpeg_path = plugin_config.tgsd_ffmpeg_path
 default_gifsicle_path = plugin_config.tgsd_gifsicle_path
 default_imagemagick_path = plugin_config.tgsd_imagemagick_path
+_subprocess_timeout = plugin_config.tgsd_subprocess_timeout
 
 
 class ConverterError(RuntimeError):
@@ -73,7 +72,27 @@ def resolve_converter_tools(
     )
 
 
-def convert_webm_to_gif(
+async def _run_subprocess(cmd: list[str]) -> tuple[int, str, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_subprocess_timeout
+        )
+        return (
+            proc.returncode or 0,
+            stdout.decode(errors="replace"),
+            stderr.decode(errors="replace"),
+        )
+    except asyncio.TimeoutError:
+        proc.kill()  # type: ignore[union-attr]
+        raise ConverterError(f"子进程超时 ({_subprocess_timeout}s): {cmd[0]}") from None
+
+
+async def convert_webm_to_gif(
     *,
     ffmpeg: str,
     src_webm: Path,
@@ -101,27 +120,29 @@ def convert_webm_to_gif(
         "-y",
         str(dst_gif),
     ]
-    proc = subprocess.run(gif_cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
+    rc, _, stderr = await _run_subprocess(gif_cmd)
+    if rc != 0:
         raise ConverterError(
-            f"ffmpeg failed converting {src_webm.name} -> {dst_gif.name}: {stderr}"
+            f"ffmpeg failed converting "
+            f"{src_webm.name} -> {dst_gif.name}: {stderr.strip()}"
         )
     if gifsicle:
-        optimize_cmd = [gifsicle, "--batch", "-O2", "--lossy=60", str(dst_gif)]
-        optimize_proc = subprocess.run(
-            optimize_cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if optimize_proc.returncode != 0:
-            stderr = (optimize_proc.stderr or "").strip()
-            raise ConverterError(f"gifsicle failed optimizing {dst_gif.name}: {stderr}")
+        optimize_cmd = [
+            gifsicle,
+            "--batch",
+            "-O2",
+            "--lossy=60",
+            str(dst_gif),
+        ]
+        rc, _, stderr = await _run_subprocess(optimize_cmd)
+        if rc != 0:
+            raise ConverterError(
+                f"gifsicle failed optimizing {dst_gif.name}: {stderr.strip()}"
+            )
     return dst_gif
 
 
-def convert_webp_to_png(
+async def convert_webp_to_png(
     *,
     imagemagick_convert: list[str] | None,
     src_image: Path,
@@ -130,14 +151,12 @@ def convert_webp_to_png(
     if not imagemagick_convert:
         raise ConverterError("ImageMagick not found for .webp -> .png conversion.")
     cmd = [*imagemagick_convert, str(src_image), str(dst_png)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
+    rc, _, stderr = await _run_subprocess(cmd)
+    if rc != 0:
         raise ConverterError(
             "ImageMagick failed converting "
-            f"{src_image.name} -> {dst_png.name}: {stderr}"
+            f"{src_image.name} -> {dst_png.name}: {stderr.strip()}"
         )
-    # logger.debug(f"Converted {src_image.name} -> {dst_png.name} using ImageMagick")
     return dst_png
 
 
@@ -147,7 +166,6 @@ def convert_webp_to_png_pillow(*, src_image: Path, dst_png: Path) -> Path:
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
             img.save(dst_png, "PNG", optimize=True)
-            # logger.debug(f"Converted {src_image.name} -> {dst_png.name} using Pillow")
         return dst_png
     except Exception as exc:
         raise ConverterError(
@@ -158,7 +176,7 @@ def convert_webp_to_png_pillow(*, src_image: Path, dst_png: Path) -> Path:
 def convert_tgs_to_gif(*, src_tgs: Path, dst_gif: Path) -> Path:
     try:
         from rlottie_python.rlottie_wrapper import LottieAnimation
-    except Exception as exc:
+    except ImportError as exc:
         raise ConverterError(
             "rlottie_python not installed. Install it to enable "
             ".tgs -> .gif conversion."
@@ -176,7 +194,7 @@ def convert_tgs_to_gif(*, src_tgs: Path, dst_gif: Path) -> Path:
     return dst_gif
 
 
-def convert_sticker_file(
+async def convert_sticker_file(
     src_file: Path,
     *,
     tools: ConverterTools | None = None,
@@ -186,7 +204,7 @@ def convert_sticker_file(
     try:
         if suffix == ".webp":
             if tools.imagemagick_convert:
-                return convert_webp_to_png(
+                return await convert_webp_to_png(
                     imagemagick_convert=tools.imagemagick_convert,
                     src_image=src_file,
                     dst_png=src_file.with_suffix(".png"),
@@ -202,7 +220,7 @@ def convert_sticker_file(
                 raise ConverterError(
                     "ffmpeg not found. Install ffmpeg or set ffmpeg path."
                 )
-            return convert_webm_to_gif(
+            return await convert_webm_to_gif(
                 ffmpeg=tools.ffmpeg,
                 src_webm=src_file,
                 dst_gif=src_file.with_suffix(".gif"),
