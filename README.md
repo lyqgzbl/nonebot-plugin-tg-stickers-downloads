@@ -121,3 +121,33 @@ sudo dnf install -y ffmpeg gifsicle ImageMagick
 - 类型：`str`
 - 默认值：`None`
 - 说明：ImageMagick 可执行文件路径（`magick` 或 `convert`）仅在配置该项时优先使用 ImageMagick 进行 `.webp -> .png` 转换; 未配置时默认使用 Pillow
+
+### tgsd_cache_expire_seconds [选填]
+
+- 类型：`int`
+- 默认值：`86400`（24 小时）
+- 说明：贴纸包缓存过期时间（秒）过期后缓存将在定时清理时被删除
+
+### tgsd_download_concurrency [选填]
+
+- 类型：`int`
+- 默认值：`5`
+- 说明：同时下载贴纸的最大并发数
+
+### tgsd_convert_concurrency [选填]
+
+- 类型：`int`
+- 默认值：`2`
+- 说明：同时进行格式转换的最大并发数
+
+### tgsd_skip_conversion [选填]
+
+- 类型：`bool`
+- 默认值：`False`
+- 说明：设为 `True` 时跳过所有格式转换, 仅保留原始文件（`.webp`、`.webm`、`.tgs`）
+
+### tgsd_subprocess_timeout [选填]
+
+- 类型：`int`
+- 默认值：`120`
+- 说明：外部转换工具（ffmpeg、gifsicle、ImageMagick）的子进程超时时间（秒）超时后进程将被终止
