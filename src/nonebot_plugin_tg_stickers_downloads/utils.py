@@ -120,7 +120,12 @@ async def _request_with_retry(
             resp = await client.request(method, url, **kwargs)
             if resp.status_code not in _RETRYABLE_STATUS_CODES:
                 return resp
-            retry_after = int(resp.headers.get("Retry-After", 2**attempt))
+            try:
+                retry_after = int(
+                    resp.headers.get("Retry-After", 2**attempt)
+                )
+            except ValueError:
+                retry_after = 2**attempt
             logger.warning(
                 f"HTTP {resp.status_code}, "
                 f"重试 {attempt + 1}/{_MAX_RETRIES} "
@@ -323,49 +328,50 @@ async def download_sticker_set(
     pack_path = tgsd_cache_path / safe_name
     await touch_pack_access(pack_path)
     _active_downloads.add(safe_name)
+    try:
+        url_cache_path = pack_path / "url_cache.json"
+        url_cache = await _load_url_cache(url_cache_path)
 
-    url_cache_path = pack_path / "url_cache.json"
-    url_cache = await _load_url_cache(url_cache_path)
+        tools = resolve_converter_tools()
+        skip_conversion = plugin_config.tgsd_skip_conversion
+        missing_tools: list[str] = []
+        if not skip_conversion:
+            missing_tools = _check_missing_tools(tools)
+            if missing_tools:
+                logger.warning(
+                    "缺少转换工具，部分贴纸将保留原始格式: " + ", ".join(missing_tools)
+                )
+        results: list[Path] = []
 
-    tools = resolve_converter_tools()
-    skip_conversion = plugin_config.tgsd_skip_conversion
-    missing_tools: list[str] = []
-    if not skip_conversion:
-        missing_tools = _check_missing_tools(tools)
-        if missing_tools:
-            logger.warning(
-                "缺少转换工具，部分贴纸将保留原始格式: " + ", ".join(missing_tools)
-            )
-    results: list[Path] = []
+        async def safe_convert(src: Path) -> Path | None:
+            async with convert_sema:
+                return await convert_sticker_file(src, tools=tools)
 
-    async def safe_convert(src: Path) -> Path | None:
-        async with convert_sema:
-            return await convert_sticker_file(src, tools=tools)
+        async def process_one(sticker: dict) -> None:
+            try:
+                fuid, file_url = await _resolve_sticker_url(sticker, url_cache)
+                if not fuid or not file_url:
+                    return
+                ext = Path(urlparse(file_url).path).suffix or ".webp"
+                downloaded = await download_sticker(file_url, pack_name, fuid + ext)
+                if not downloaded:
+                    return
+                if skip_conversion:
+                    results.append(downloaded)
+                    return
+                converted = await safe_convert(downloaded)
+                results.append(converted or downloaded)
+            except Exception as e:
+                fuid = sticker.get("file_unique_id", "unknown")
+                logger.error(f"处理贴纸 {fuid} 失败: {e}")
 
-    async def process_one(sticker: dict) -> None:
-        try:
-            fuid, file_url = await _resolve_sticker_url(sticker, url_cache)
-            if not fuid or not file_url:
-                return
-            ext = Path(urlparse(file_url).path).suffix or ".webp"
-            downloaded = await download_sticker(file_url, pack_name, fuid + ext)
-            if not downloaded:
-                return
-            if skip_conversion:
-                results.append(downloaded)
-                return
-            converted = await safe_convert(downloaded)
-            results.append(converted or downloaded)
-        except Exception as e:
-            fuid = sticker.get("file_unique_id", "unknown")
-            logger.error(f"处理贴纸 {fuid} 失败: {e}")
+        async with anyio.create_task_group() as tg:
+            for sticker in stickers:
+                tg.start_soon(process_one, sticker)
 
-    async with anyio.create_task_group() as tg:
-        for sticker in stickers:
-            tg.start_soon(process_one, sticker)
-
-    await _save_url_cache(url_cache_path, url_cache)
-    _active_downloads.discard(safe_name)
+        await _save_url_cache(url_cache_path, url_cache)
+    finally:
+        _active_downloads.discard(safe_name)
     return results, missing_tools
 
 
