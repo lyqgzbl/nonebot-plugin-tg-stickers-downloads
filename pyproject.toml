@@ -21,6 +21,8 @@ dependencies = [
 dev = [
     "ruff>=0.15.8",
     "ty>=0.0.26",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
 ]
 
 [tool.ruff]
@@ -52,3 +54,7 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
