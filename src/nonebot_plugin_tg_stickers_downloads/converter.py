@@ -1,9 +1,11 @@
 import asyncio
 import shutil
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import PIL.Image as pil_image
+from anyio import to_thread
 
 from nonebot.log import logger
 from .config import plugin_config
@@ -210,9 +212,12 @@ async def convert_sticker_file(
                     dst_png=src_file.with_suffix(".png"),
                 )
             if tools.use_pillow:
-                return convert_webp_to_png_pillow(
-                    src_image=src_file,
-                    dst_png=src_file.with_suffix(".png"),
+                return await to_thread.run_sync(
+                    partial(
+                        convert_webp_to_png_pillow,
+                        src_image=src_file,
+                        dst_png=src_file.with_suffix(".png"),
+                    )
                 )
             raise ConverterError("Neither ImageMagick nor Pillow is available.")
         if suffix == ".webm":
@@ -227,9 +232,12 @@ async def convert_sticker_file(
                 gifsicle=tools.gifsicle,
             )
         if suffix == ".tgs":
-            return convert_tgs_to_gif(
-                src_tgs=src_file,
-                dst_gif=src_file.with_suffix(".gif"),
+            return await to_thread.run_sync(
+                partial(
+                    convert_tgs_to_gif,
+                    src_tgs=src_file,
+                    dst_gif=src_file.with_suffix(".gif"),
+                )
             )
     except ConverterError as exc:
         logger.error(f"转换失败 {src_file.name}: {exc}")
