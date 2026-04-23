@@ -1,6 +1,7 @@
 from pathlib import Path
+import re
 
-from nonebot import get_driver, get_plugin_config, require
+from nonebot import get_driver, require
 from nonebot.log import logger
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
 from nonebot.rule import Rule
@@ -18,7 +19,7 @@ from nonebot_plugin_alconna import (
     on_alconna,
 )
 
-from .config import Config
+from .config import Config, plugin_config
 from .utils import (
     get_sticker_set,
     get_sticker_info,
@@ -41,9 +42,6 @@ __plugin_meta__ = PluginMetadata(
         "version": "0.2.1",
     },
 )
-
-
-plugin_config = get_plugin_config(Config)
 
 
 def _is_enable() -> Rule:
@@ -84,13 +82,38 @@ tgsd_command.shortcut(
 )
 
 
+_PACK_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
+
+
+async def _download_and_pack(
+    data: dict,
+) -> tuple[dict[str, Path], list[str]]:
+    _, missing_tools = await download_sticker_set(data)
+    pack_name = data.get("name", "pack")
+    all_paths = get_pack_all_files(pack_name)
+    zips = await async_save_zips(all_paths, pack_name)
+    return zips, missing_tools
+
+
+async def _send_zips(zips: dict[str, Path]) -> None:
+    try:
+        for zip_path in zips.values():
+            await UniMessage.file(path=zip_path, name=zip_path.name).send()
+    finally:
+        for zip_path in zips.values():
+            if zip_path.exists():
+                zip_path.unlink()
+
+
 @tgsd_command.handle()
 async def handle_tgsd(sticker_pack_url: str) -> None:
     set_name: str = sticker_pack_url.split("/")[-1]
+    if not _PACK_NAME_RE.match(set_name):
+        await tgsd_command.finish("无效的贴纸包名称，请提供正确的 URL 或名称")
     data = await get_sticker_set(set_name)
     if not data:
         await tgsd_command.finish("获取贴纸包信息失败, 请稍后再试")
-    info = await get_sticker_info(data) if data else "获取贴纸包信息失败"
+    info = get_sticker_info(data)
     msg = (
         UniMessage("贴纸包信息\n\n")
         + Text(info)
@@ -102,28 +125,21 @@ async def handle_tgsd(sticker_pack_url: str) -> None:
     if resp.extract_plain_text().strip().lower() != "y":
         await tgsd_command.finish("已取消")
     try:
-        await download_sticker_set(data)
+        zips, missing_tools = await _download_and_pack(data)
     except Exception as e:
         logger.exception(f"下载贴纸包失败: {e}")
         await tgsd_command.finish("下载贴纸包失败, 请稍后重试")
-    await tgsd_command.send("图片下载完成, 正在打包...")
-    all_downloaded_paths = get_pack_all_files(data.get("name", "pack"))
-    zips: dict[str, Path] = await async_save_zips(
-        all_downloaded_paths, data.get("name", "pack")
-    )
-    await tgsd_command.send("图片打包完成, 正在发送...")
+    if missing_tools:
+        await tgsd_command.send(
+            "提示: 缺少转换工具，部分贴纸将保留原始格式: " + ", ".join(missing_tools)
+        )
+    await tgsd_command.send("图片下载/打包完成, 正在发送...")
     logger.debug(
-        f"贴纸包 {data.get('name', 'unknown')} 下载完成, "
-        f"共 {len(all_downloaded_paths)} 个文件, 打包成 {len(zips)} 个 zip"
+        f"贴纸包 {data.get('name', 'unknown')} 处理完成, 打包成 {len(zips)} 个 zip"
     )
     try:
-        for zip_path in zips.values():
-            await UniMessage.file(path=zip_path, name=zip_path.name).send()
+        await _send_zips(zips)
     except Exception as e:
         logger.exception(f"发送压缩包失败: {e}")
         await tgsd_command.finish("下载完成, 但发送压缩包失败, 请稍后重试")
-    finally:
-        for zip_path in zips.values():
-            if zip_path.exists():
-                zip_path.unlink()
     await tgsd_command.finish("下载并发送完成")
