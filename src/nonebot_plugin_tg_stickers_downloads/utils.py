@@ -5,24 +5,28 @@ import time
 import shutil
 from functools import partial
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
-import aiofiles
 import anyio
+import aiofiles
 import httpx
 from anyio import to_thread
 
-from nonebot import get_driver, get_plugin_config
+from nonebot import get_driver
 from nonebot.log import logger
 
 import nonebot_plugin_localstore as store
 from nonebot_plugin_apscheduler import scheduler
 
-from .config import Config
-from .converter import convert_sticker_file, resolve_converter_tools
+from .config import plugin_config
+from .converter import (
+    ConverterTools,
+    convert_sticker_file,
+    resolve_converter_tools,
+)
 
 
-plugin_config = get_plugin_config(Config)
 bot_token = plugin_config.tgsd_bot_token
 proxy = plugin_config.tgsd_proxy
 tgsd_cache_path = store.get_plugin_cache_dir()
@@ -60,7 +64,7 @@ async def get_sticker_set(set_name: str) -> dict | None:
     params = {"name": set_name}
     client = get_httpx_client()
     try:
-        response = await client.get(url, params=params)
+        response = await _request_with_retry(client, "GET", url, params=params)
         response.raise_for_status()
         data: dict = response.json()
         if not data.get("ok"):
@@ -77,7 +81,7 @@ async def get_sticker_set(set_name: str) -> dict | None:
     return None
 
 
-async def get_sticker_info(data: dict) -> str:
+def get_sticker_info(data: dict) -> str:
     name = data.get("name", "Unknown")
     title = data.get("title", "Unknown")
     sticker_type = data.get("sticker_type", "regular")
@@ -92,15 +96,56 @@ async def get_sticker_info(data: dict) -> str:
 
 
 def _safe_name(name: str) -> str:
-    return name.replace("/", "_").replace("..", "_")
+    return re.sub(r"[^\w.\-]", "_", name)
 
 
 def _mask_token(text: str) -> str:
     return re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***:***", str(text))
 
 
-download_sema = anyio.Semaphore(5)
-convert_sema = anyio.Semaphore(2)
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_MAX_RETRIES = 3
+
+
+async def _request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    last_exc: Exception | None = None
+    resp: httpx.Response | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = await client.request(method, url, **kwargs)
+            if resp.status_code not in _RETRYABLE_STATUS_CODES:
+                return resp
+            retry_after = int(resp.headers.get("Retry-After", 2**attempt))
+            logger.warning(
+                f"HTTP {resp.status_code}, "
+                f"重试 {attempt + 1}/{_MAX_RETRIES} "
+                f"(等待 {retry_after}s)"
+            )
+            await anyio.sleep(retry_after)
+        except httpx.RequestError as e:  # noqa: PERF203
+            last_exc = e
+            wait = 2**attempt
+            logger.warning(
+                f"请求失败: {_mask_token(str(e))}, "
+                f"重试 {attempt + 1}/{_MAX_RETRIES} "
+                f"(等待 {wait}s)"
+            )
+            await anyio.sleep(wait)
+    if last_exc:
+        raise last_exc
+    assert resp is not None
+    return resp
+
+
+download_sema = anyio.Semaphore(plugin_config.tgsd_download_concurrency)
+convert_sema = anyio.Semaphore(plugin_config.tgsd_convert_concurrency)
+
+_active_downloads: set[str] = set()
 
 
 async def download_sticker(
@@ -117,8 +162,7 @@ async def download_sticker(
         async with download_sema, client.stream("GET", file_url, timeout=30.0) as resp:
             if resp.status_code != 200:
                 logger.error(
-                    f"下载失败 {_mask_token(file_url)}: "
-                    f"状态码 {resp.status_code}"
+                    f"下载失败 {_mask_token(file_url)}: 状态码 {resp.status_code}"
                 )
                 return None
             written = 0
@@ -153,7 +197,9 @@ async def get_single_sticker_url(sticker: dict) -> str | None:
     url = f"https://api.telegram.org/bot{bot_token}/getFile"
     try:
         async with download_sema:
-            resp = await client.get(url, params={"file_id": fid})
+            resp = await _request_with_retry(
+                client, "GET", url, params={"file_id": fid}
+            )
             resp.raise_for_status()
             data = resp.json()
             if not data.get("ok"):
@@ -226,36 +272,101 @@ def get_pack_all_files(pack_name: str) -> list[Path]:
     return [p for p in pack_path.rglob("*") if p.is_file()]
 
 
-async def download_sticker_set(data: dict) -> list[Path]:
+def _check_missing_tools(tools: ConverterTools) -> list[str]:
+    missing: list[str] = []
+    if not tools.ffmpeg:
+        missing.append("ffmpeg (.webm -> .gif)")
+    if not tools.imagemagick_convert and not tools.use_pillow:
+        missing.append("ImageMagick/Pillow (.webp -> .png)")
+    return missing
+
+
+async def _load_url_cache(cache_path: Path) -> dict[str, str]:
+    if not cache_path.exists():
+        return {}
+    try:
+        async with aiofiles.open(cache_path, encoding="utf-8") as f:
+            return json.loads(await f.read())
+    except Exception:
+        return {}
+
+
+async def _save_url_cache(cache_path: Path, cache: dict[str, str]) -> None:
+    try:
+        async with aiofiles.open(cache_path, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(cache))
+    except Exception:
+        pass
+
+
+async def _resolve_sticker_url(
+    sticker: dict, url_cache: dict[str, str]
+) -> tuple[str | None, str | None]:
+    fuid = sticker.get("file_unique_id")
+    if not fuid:
+        return None, None
+    file_url = url_cache.get(fuid)
+    if not file_url:
+        file_url = await get_single_sticker_url(sticker)
+        if file_url:
+            url_cache[fuid] = file_url
+    return fuid, file_url
+
+
+async def download_sticker_set(
+    data: dict,
+) -> tuple[list[Path], list[str]]:
     pack_name = data.get("name", "UnknownPack")
+    safe_name = _safe_name(pack_name)
     stickers = data.get("stickers", [])
     await save_pack_metadata(pack_name, data)
-    pack_path = tgsd_cache_path / _safe_name(pack_name)
+    pack_path = tgsd_cache_path / safe_name
     await touch_pack_access(pack_path)
+    _active_downloads.add(safe_name)
+
+    url_cache_path = pack_path / "url_cache.json"
+    url_cache = await _load_url_cache(url_cache_path)
+
     tools = resolve_converter_tools()
+    skip_conversion = plugin_config.tgsd_skip_conversion
+    missing_tools: list[str] = []
+    if not skip_conversion:
+        missing_tools = _check_missing_tools(tools)
+        if missing_tools:
+            logger.warning(
+                "缺少转换工具，部分贴纸将保留原始格式: " + ", ".join(missing_tools)
+            )
     results: list[Path] = []
 
     async def safe_convert(src: Path) -> Path | None:
         async with convert_sema:
-            return await to_thread.run_sync(
-                partial(convert_sticker_file, src, tools=tools)
-            )
+            return await convert_sticker_file(src, tools=tools)
 
     async def process_one(sticker: dict) -> None:
-        fuid = sticker.get("file_unique_id")
-        file_url = await get_single_sticker_url(sticker)
-        if file_url and fuid:
-            ext = Path(urlparse(file_url).path).suffix or ".webp"
-            downloaded_path = await download_sticker(file_url, pack_name, fuid + ext)
-            if not downloaded_path:
+        try:
+            fuid, file_url = await _resolve_sticker_url(sticker, url_cache)
+            if not fuid or not file_url:
                 return
-            converted_path = await safe_convert(downloaded_path)
-            results.append(converted_path or downloaded_path)
+            ext = Path(urlparse(file_url).path).suffix or ".webp"
+            downloaded = await download_sticker(file_url, pack_name, fuid + ext)
+            if not downloaded:
+                return
+            if skip_conversion:
+                results.append(downloaded)
+                return
+            converted = await safe_convert(downloaded)
+            results.append(converted or downloaded)
+        except Exception as e:
+            fuid = sticker.get("file_unique_id", "unknown")
+            logger.error(f"处理贴纸 {fuid} 失败: {e}")
 
     async with anyio.create_task_group() as tg:
         for sticker in stickers:
             tg.start_soon(process_one, sticker)
-    return results
+
+    await _save_url_cache(url_cache_path, url_cache)
+    _active_downloads.discard(safe_name)
+    return results, missing_tools
 
 
 def create_split_zips(
@@ -271,13 +382,27 @@ def create_split_zips(
     orig_files = [p for p in all_paths if p.suffix.lower() in original_suffixes]
     conv_files = [p for p in all_paths if p.suffix.lower() in converted_suffixes]
 
+    _compressed_suffixes = {
+        ".webp",
+        ".webm",
+        ".png",
+        ".gif",
+        ".jpg",
+        ".jpeg",
+    }
+
     def _write_zip(path: Path, files: list[Path]):
         if not files:
             return None
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(path, "w") as zf:
             for f in files:
                 if f.exists():
-                    zf.write(f, arcname=f.name)
+                    compress = (
+                        zipfile.ZIP_STORED
+                        if f.suffix.lower() in _compressed_suffixes
+                        else zipfile.ZIP_DEFLATED
+                    )
+                    zf.write(f, arcname=f.name, compress_type=compress)
         return path
 
     return _write_zip(orig_zip_path, orig_files), _write_zip(conv_zip_path, conv_files)
@@ -298,13 +423,13 @@ async def async_save_zips(all_paths: list[Path], pack_name: str) -> dict[str, Pa
 
 async def delete_pack(pack_path: Path) -> None:
     try:
-        await to_thread.run_sync(shutil.rmtree, pack_path)
+        await to_thread.run_sync(partial(shutil.rmtree, pack_path))
     except Exception as e:
         logger.error(f"删除贴纸包缓存失败: {e}")
 
 
 async def clean_cache(base_path: Path) -> None:
-    EXPIRE_SECONDS = 24 * 3600
+    EXPIRE_SECONDS = plugin_config.tgsd_cache_expire_seconds
     now = int(time.time())
     if not base_path.exists():
         return
@@ -312,6 +437,8 @@ async def clean_cache(base_path: Path) -> None:
         if not pack_path.is_dir():
             continue
         if pack_path.name == "zip":
+            continue
+        if pack_path.name in _active_downloads:
             continue
         meta = await load_pack_timestamp(pack_path)
         if not meta:
