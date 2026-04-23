@@ -101,7 +101,11 @@ async def handle_tgsd(sticker_pack_url: str) -> None:
         await tgsd_command.finish("操作超时, 已取消")
     if resp.extract_plain_text().strip().lower() != "y":
         await tgsd_command.finish("已取消")
-    await download_sticker_set(data)
+    try:
+        await download_sticker_set(data)
+    except Exception as e:
+        logger.exception(f"下载贴纸包失败: {e}")
+        await tgsd_command.finish("下载贴纸包失败, 请稍后重试")
     await tgsd_command.send("图片下载完成, 正在打包...")
     all_downloaded_paths = get_pack_all_files(data.get("name", "pack"))
     zips: dict[str, Path] = await async_save_zips(
