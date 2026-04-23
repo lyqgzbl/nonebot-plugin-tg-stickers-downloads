@@ -1,9 +1,11 @@
 import json
+import re
 import zipfile
 import time
 import shutil
 from functools import partial
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiofiles
 import anyio
@@ -71,7 +73,7 @@ async def get_sticker_set(set_name: str) -> dict | None:
             f"Telegram API 响应错误: {e.response.status_code} - {e.response.text}"
         )
     except httpx.RequestError as e:
-        logger.error(f"请求 Telegram API 时发生错误: {e}")
+        logger.error(f"请求 Telegram API 时发生错误: {_mask_token(str(e))}")
     return None
 
 
@@ -93,6 +95,10 @@ def _safe_name(name: str) -> str:
     return name.replace("/", "_").replace("..", "_")
 
 
+def _mask_token(text: str) -> str:
+    return re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***:***", str(text))
+
+
 download_sema = anyio.Semaphore(5)
 convert_sema = anyio.Semaphore(2)
 
@@ -110,7 +116,10 @@ async def download_sticker(
     try:
         async with download_sema, client.stream("GET", file_url, timeout=30.0) as resp:
             if resp.status_code != 200:
-                logger.error(f"下载失败 {file_url}: 状态码 {resp.status_code}")
+                logger.error(
+                    f"下载失败 {_mask_token(file_url)}: "
+                    f"状态码 {resp.status_code}"
+                )
                 return None
             written = 0
             async with aiofiles.open(temp_path, "wb") as f:
@@ -119,7 +128,7 @@ async def download_sticker(
                         written += len(chunk)
                         await f.write(chunk)
             if written == 0:
-                logger.error(f"下载为空文件: {file_url}")
+                logger.error(f"下载为空文件: {_mask_token(file_url)}")
                 if temp_path.exists():
                     temp_path.unlink()
                 return None
@@ -152,7 +161,7 @@ async def get_single_sticker_url(sticker: dict) -> str | None:
             file_path = data["result"]["file_path"]
             return f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
     except Exception as e:
-        logger.error(f"获取 file_path 失败: {e}")
+        logger.error(f"获取 file_path 失败: {_mask_token(str(e))}")
         return None
 
 
@@ -236,7 +245,7 @@ async def download_sticker_set(data: dict) -> list[Path]:
         fuid = sticker.get("file_unique_id")
         file_url = await get_single_sticker_url(sticker)
         if file_url and fuid:
-            ext = Path(file_url).suffix or ".webp"
+            ext = Path(urlparse(file_url).path).suffix or ".webp"
             downloaded_path = await download_sticker(file_url, pack_name, fuid + ext)
             if not downloaded_path:
                 return
@@ -277,7 +286,7 @@ def create_split_zips(
 async def async_save_zips(all_paths: list[Path], pack_name: str) -> dict[str, Path]:
     await touch_pack_access(tgsd_cache_path / _safe_name(pack_name))
     results = await to_thread.run_sync(
-        create_split_zips, all_paths, pack_name, tgsd_cache_path
+        partial(create_split_zips, all_paths, pack_name, tgsd_cache_path)
     )
     zip_map = {}
     if results[0]:
